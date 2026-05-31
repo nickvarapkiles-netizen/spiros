@@ -391,6 +391,46 @@ export default function Home() {
     );
   }
 
+  /** One-click move of an entire sub-bucket to the OTHER group,
+   * preserving its name. So a "Dates" bucket sitting under Personal
+   * becomes "Dates" under Work after one click. We also deduplicate
+   * prior sub-level overrides for this fromSub so repeatedly swapping
+   * doesn't accumulate stale rules. */
+  function swapSubGroup(fromSub: string, currentGroup: "Work" | "Personal") {
+    const otherGroup: "Work" | "Personal" =
+      currentGroup === "Work" ? "Personal" : "Work";
+    let movedCount = 0;
+    patchSession((cur) => {
+      const effective = getEffectiveEntries(
+        cur.riseEntries,
+        cur.manualEntries,
+        cur.categoryOverrides,
+        cur.hiddenEntryIds,
+      );
+      movedCount = effective.filter(
+        (e) => e.sub.toLowerCase() === fromSub.toLowerCase(),
+      ).length;
+      // Drop any prior sub-level overrides whose fromSub matches —
+      // the new override replaces them so we don't end up with a
+      // stack of conflicting rules pointing different directions.
+      const filtered = (cur.categoryOverrides ?? []).filter(
+        (o) =>
+          !o.fromSub || o.fromSub.toLowerCase() !== fromSub.toLowerCase(),
+      );
+      return {
+        categoryOverrides: [
+          ...filtered,
+          { fromSub, group: otherGroup, sub: fromSub },
+        ],
+      };
+    });
+    flashToast(
+      movedCount > 0
+        ? `✓ Moved "${fromSub}" → ${otherGroup} (${movedCount} entr${movedCount === 1 ? "y" : "ies"})`
+        : `✓ "${fromSub}" set to ${otherGroup}`,
+    );
+  }
+
   /** Add a sub→sub override so all entries currently tagged with `fromSub`
    * display under the new group/sub. */
   function recategorizeSub(
@@ -506,6 +546,7 @@ export default function Home() {
         onRecategorizeEntry={recategorizeEntry}
         subAliases={state.subAliases}
         onRenameSub={setSubAlias}
+        onSwapSubGroup={swapSubGroup}
       />
       <StrategySection
         transcript={session.transcript}
@@ -2137,6 +2178,7 @@ function TimeTrackerSection({
   onRecategorizeEntry,
   subAliases,
   onRenameSub,
+  onSwapSubGroup,
 }: {
   range: DateRangeId;
   onRangeChange: (r: DateRangeId) => void;
@@ -2162,6 +2204,10 @@ function TimeTrackerSection({
   ) => void;
   subAliases?: Record<string, string>;
   onRenameSub: (canonical: string, newName: string) => void;
+  onSwapSubGroup: (
+    fromSub: string,
+    currentGroup: "Work" | "Personal",
+  ) => void;
 }) {
   const cfg = DATE_RANGES.find((r) => r.id === range)!;
   const hasReal = !!(session.riseEntries && session.riseEntries.length > 0) || !!(session.manualEntries && session.manualEntries.length > 0);
@@ -2309,6 +2355,7 @@ function TimeTrackerSection({
           onAddSubInGroup={openAdderForGroup}
           subAliases={subAliases}
           onRenameSub={onRenameSub}
+          onSwapSubGroup={onSwapSubGroup}
         />
         <CategoryGroupCard
           group={personal}
@@ -2323,6 +2370,7 @@ function TimeTrackerSection({
           onAddSubInGroup={openAdderForGroup}
           subAliases={subAliases}
           onRenameSub={onRenameSub}
+          onSwapSubGroup={onSwapSubGroup}
         />
       </div>
 
@@ -2702,6 +2750,7 @@ function SubActions({
   onRecategorizeSub,
   subAliases,
   onRenameSub,
+  onSwapSubGroup,
 }: {
   sub: string;
   groupName: "Work" | "Personal";
@@ -2716,6 +2765,10 @@ function SubActions({
   ) => void;
   subAliases?: Record<string, string>;
   onRenameSub?: (canonical: string, newName: string) => void;
+  onSwapSubGroup?: (
+    fromSub: string,
+    currentGroup: "Work" | "Personal",
+  ) => void;
 }) {
   const [showMove, setShowMove] = useState(false);
   const [toGroup, setToGroup] = useState<"Work" | "Personal">(groupName);
@@ -2748,6 +2801,28 @@ function SubActions({
           }
         >
           {showRename ? "cancel" : "✎ rename"}
+        </button>
+      )}
+      {onSwapSubGroup && (
+        <button
+          type="button"
+          onClick={() => {
+            const other = groupName === "Work" ? "Personal" : "Work";
+            const display = subAliases?.[sub] ?? sub;
+            if (
+              count === 0 ||
+              confirm(
+                `Move all ${count} entr${count === 1 ? "y" : "ies"} in "${display}" from ${groupName} → ${other}?`,
+              )
+            ) {
+              onSwapSubGroup(sub, groupName);
+            }
+          }}
+          style={{ color }}
+          className="opacity-70 hover:opacity-100"
+          title={`Move this whole sub-bucket from ${groupName} to ${groupName === "Work" ? "Personal" : "Work"}`}
+        >
+          ⇆ swap to {groupName === "Work" ? "Personal" : "Work"}
         </button>
       )}
       {onRecategorizeSub && (
@@ -3660,6 +3735,7 @@ function CategoryGroupCard({
   onAddSubInGroup,
   subAliases,
   onRenameSub,
+  onSwapSubGroup,
 }: {
   group: CategoryGroup;
   accent: string;
@@ -3685,6 +3761,10 @@ function CategoryGroupCard({
   onAddSubInGroup?: (group: "Work" | "Personal") => void;
   subAliases?: Record<string, string>;
   onRenameSub?: (canonical: string, newName: string) => void;
+  onSwapSubGroup?: (
+    fromSub: string,
+    currentGroup: "Work" | "Personal",
+  ) => void;
 }) {
   const total = group.subs.reduce((s, x) => s + x.minutes, 0);
   const max = Math.max(1, ...group.subs.map((s) => s.minutes));
@@ -3788,6 +3868,7 @@ function CategoryGroupCard({
                   onRecategorizeSub={onRecategorizeSub}
                   subAliases={subAliases}
                   onRenameSub={onRenameSub}
+                  onSwapSubGroup={onSwapSubGroup}
                 />
               )}
               {isOpen && subEntries.length > 0 && (
