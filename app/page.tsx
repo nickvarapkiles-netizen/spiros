@@ -18,13 +18,20 @@ import {
   SpirosState,
   aggregateEntries,
   colorForSub,
+  computeReadiness,
   emptyState,
   ensureSession,
+  loadStateFromServer,
+  saveStateToServer,
+  type ReadinessRow,
+  type ReadinessRowId,
+  type ReadinessState,
   filterEntriesByRange,
   fmtHours,
   fmtMinutes,
   fmtTime,
   formatWeekRange,
+  fromISODate,
   getEffectiveEntries,
   groupByDay,
   hoursLeft,
@@ -32,9 +39,9 @@ import {
   newItem,
   parseRizeCSV,
   riceScore,
-  sampleTimeWeek,
   saveState,
   seedSession,
+  toISODate,
   weekStartFor,
 } from "@/lib/spiros";
 import {
@@ -47,6 +54,14 @@ import {
 export default function Home() {
   const [hydrated, setHydrated] = useState(false);
   const [state, setState] = useState<SpirosState>(emptyState());
+  // serverSynced gates writes to /api/state: we never POST until we've
+  // first GET'd the canonical state, otherwise a fresh browser would
+  // clobber the server with its empty initial state.
+  const [serverSynced, setServerSynced] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<
+    "idle" | "saving" | "saved" | "error"
+  >("idle");
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [range, setRange] = useState<DateRangeId>("7d");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [showNewForm, setShowNewForm] = useState(false);
@@ -59,29 +74,133 @@ export default function Home() {
     toastTimerRef.current = setTimeout(() => setToast(null), 3000);
   }
 
-  const currentWeek = weekStartFor();
+  const todaysWeek = weekStartFor();
+  const [viewedWeek, setViewedWeek] = useState<string>(todaysWeek);
 
-  // Load from localStorage on mount; seed if empty
+  // Load order (so the UI is instant AND the server is the source of truth):
+  //   1. Read localStorage immediately so the user sees their last cached
+  //      state with no spinner.
+  //   2. Fetch /api/state. If the server has data, it wins (handles the
+  //      "different browser / cleared storage / new deploy URL" cases).
+  //   3. If the server has no row yet, push the local state up so we
+  //      seed the DB. From then on, every change is debounced-POSTed.
   useEffect(() => {
+    let cancelled = false;
     let loaded = loadState();
     if (Object.keys(loaded.sessions).length === 0) {
-      const seeded = seedSession(currentWeek);
-      loaded = { ...loaded, sessions: { [currentWeek]: seeded } };
-    } else if (!loaded.sessions[currentWeek]) {
-      loaded = ensureSession(loaded, currentWeek);
+      const seeded = seedSession(todaysWeek);
+      loaded = { ...loaded, sessions: { [todaysWeek]: seeded } };
+    } else if (!loaded.sessions[todaysWeek]) {
+      // New week — pull forward last week's unfinished priorities so
+      // Nick doesn't lose them every Sunday.
+      loaded = ensureSession(loaded, todaysWeek, true);
     }
     setState(loaded);
     setHydrated(true);
-  }, [currentWeek]);
 
-  // Persist on every change after hydration
+    // Async: reconcile with server.
+    (async () => {
+      try {
+        const serverState = await loadStateFromServer();
+        if (cancelled) return;
+        // Server "wins" only if it actually has session data. An empty
+        // `{sessions:{}}` row (e.g. left behind by a dev/test seed)
+        // should NOT clobber a browser that has real local data —
+        // otherwise refreshing wipes the user. If both are empty,
+        // local wins trivially and seeds the DB on first save.
+        const serverHasData =
+          serverState !== null &&
+          Object.keys(serverState.sessions).length > 0;
+        if (serverHasData) {
+          let next = serverState!;
+          if (!next.sessions[todaysWeek]) {
+            // Same carry-forward rule as the local-load path.
+            next = ensureSession(next, todaysWeek, true);
+          }
+          setState(next);
+        } else {
+          // Server is empty (no row, or stub row with no sessions) —
+          // push the local cache up so the DB gets seeded with real
+          // data on first run.
+          await saveStateToServer(loaded);
+        }
+        if (!cancelled) setServerSynced(true);
+      } catch (err) {
+        console.warn("[spiros] server sync failed, using local cache", err);
+        if (!cancelled) {
+          // We failed to read the server. Don't enable server writes —
+          // we'd risk overwriting good server data with stale local
+          // data. localStorage keeps working as before.
+          setSyncStatus("error");
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // If a past Oracle exists but today's is empty, default the view to the
+    // most recent week that ACTUALLY has data so the user lands on something
+    // useful (their last work) instead of an empty new Oracle.
+    const todaysSession = loaded.sessions[todaysWeek];
+    const todaysIsEmpty =
+      !todaysSession ||
+      ((todaysSession.items?.length ?? 0) === 0 &&
+        (todaysSession.riseEntries?.length ?? 0) === 0 &&
+        (todaysSession.manualEntries?.length ?? 0) === 0);
+    if (todaysIsEmpty) {
+      const past = Object.keys(loaded.sessions)
+        .filter((k) => k < todaysWeek)
+        .filter((k) => {
+          const s = loaded.sessions[k];
+          return (
+            (s.items?.length ?? 0) > 0 ||
+            (s.riseEntries?.length ?? 0) > 0 ||
+            (s.manualEntries?.length ?? 0) > 0
+          );
+        })
+        .sort()
+        .reverse();
+      if (past.length > 0) setViewedWeek(past[0]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Make sure whichever week the user navigates to has at least an empty
+  // session in state (so patchSession etc. work) — but never seed past weeks
+  // with example data.
   useEffect(() => {
-    if (hydrated) saveState(state);
-  }, [state, hydrated]);
+    if (!hydrated) return;
+    if (state.sessions[viewedWeek]) return;
+    setState((prev) => ensureSession(prev, viewedWeek));
+  }, [viewedWeek, hydrated, state.sessions]);
+
+  // Persist on every change after hydration.
+  //   - localStorage write is synchronous and immediate (instant cache,
+  //     also survives offline).
+  //   - Server POST is debounced ~800ms after the last change so rapid
+  //     edits (typing, slider drags) coalesce into one round trip.
+  useEffect(() => {
+    if (!hydrated) return;
+    saveState(state);
+    if (!serverSynced) return; // wait until we've reconciled with server
+
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    setSyncStatus("saving");
+    saveTimerRef.current = setTimeout(async () => {
+      try {
+        await saveStateToServer(state);
+        setSyncStatus("saved");
+      } catch (err) {
+        console.warn("[spiros] server save failed", err);
+        setSyncStatus("error");
+      }
+    }, 800);
+  }, [state, hydrated, serverSynced]);
 
   const session: OracleSession =
-    state.sessions[currentWeek] ?? {
-      weekStart: currentWeek,
+    state.sessions[viewedWeek] ?? {
+      weekStart: viewedWeek,
       items: [],
       transcript: "",
     };
@@ -93,8 +212,8 @@ export default function Home() {
   ) {
     setState((prev) => {
       const existing: OracleSession =
-        prev.sessions[currentWeek] ?? {
-          weekStart: currentWeek,
+        prev.sessions[viewedWeek] ?? {
+          weekStart: viewedWeek,
           items: [],
           transcript: "",
         };
@@ -106,7 +225,7 @@ export default function Home() {
         ...prev,
         sessions: {
           ...prev.sessions,
-          [currentWeek]: { ...existing, ...patch },
+          [viewedWeek]: { ...existing, ...patch },
         },
       };
     });
@@ -152,6 +271,15 @@ export default function Home() {
     patchSession({
       calendarEvents: events ?? undefined,
       calendarFetchedAt: events ? Date.now() : undefined,
+    });
+  }
+
+  function toggleLock(id: ReadinessRowId) {
+    patchSession((cur) => {
+      const cur_ = cur.lockedInputs ?? {};
+      return {
+        lockedInputs: { ...cur_, [id]: !cur_[id] },
+      };
     });
   }
 
@@ -213,6 +341,31 @@ export default function Home() {
     } else {
       flashToast(`No entries found in "${sub}" — nothing to hide`);
     }
+  }
+
+  /** Move a single time-tracker entry into a new group+sub. Used when
+   * Nick clicks "move" on one row inside an expanded bucket. Persists
+   * as a CategoryOverride so the move survives refresh and shows up
+   * everywhere the entry is rendered. */
+  function recategorizeEntry(
+    entryId: string,
+    toGroup: "Work" | "Personal",
+    toSub: string,
+  ) {
+    patchSession((cur) => {
+      // Drop any existing per-entry override for this entry so we don't
+      // accumulate stale overrides on repeated moves.
+      const filtered = (cur.categoryOverrides ?? []).filter(
+        (o) => o.entryId !== entryId,
+      );
+      return {
+        categoryOverrides: [
+          ...filtered,
+          { entryId, group: toGroup, sub: toSub },
+        ],
+      };
+    });
+    flashToast(`✓ Moved entry → ${toGroup}/${toSub}`);
   }
 
   /** Add a sub→sub override so all entries currently tagged with `fromSub`
@@ -286,7 +439,18 @@ export default function Home() {
 
   return (
     <main className="mx-auto max-w-7xl px-6 py-8 w-full">
-      <Header weekStart={currentWeek} />
+      <Header weekStart={viewedWeek} />
+      <WeekPicker
+        viewedWeek={viewedWeek}
+        todaysWeek={todaysWeek}
+        sessions={state.sessions}
+        onPick={setViewedWeek}
+      />
+      <WeeklyReadinessStrip
+        readiness={computeReadiness(session)}
+        onToggleLock={toggleLock}
+        syncStatus={syncStatus}
+      />
       <DebriefPanel
         session={session}
         onSetDebrief={setDebrief}
@@ -316,6 +480,7 @@ export default function Home() {
         onUpdateManualEntry={updateManualEntry}
         onClearSub={clearSub}
         onRecategorizeSub={recategorizeSub}
+        onRecategorizeEntry={recategorizeEntry}
       />
       <StrategySection
         transcript={session.transcript}
@@ -340,11 +505,11 @@ export default function Home() {
           items={done}
           onReopen={reopen}
           onDelete={deleteItem}
-          rangeLabel={`this Oracle · ${formatWeekRange(currentWeek)}`}
+          rangeLabel={`this Oracle · ${formatWeekRange(viewedWeek)}`}
         />
       )}
       <footer className="mt-12 pt-6 border-t border-[var(--hairline)] text-xs opacity-50 flex justify-between">
-        <span>Spiros · The Oracle · {formatWeekRange(currentWeek)}</span>
+        <span>Spiros · The Oracle · {formatWeekRange(viewedWeek)}</span>
         <span>v0.3 · Rize CSV · calendar · Claude brain dump</span>
       </footer>
       {toast && (
@@ -1642,6 +1807,247 @@ function ChatBubble({ msg }: { msg: ChatMessage }) {
   );
 }
 
+/* ─── Week picker ────────────────────────────────────────────── */
+
+function WeekPicker({
+  viewedWeek,
+  todaysWeek,
+  sessions,
+  onPick,
+}: {
+  viewedWeek: string;
+  todaysWeek: string;
+  sessions: Record<string, OracleSession>;
+  onPick: (weekStart: string) => void;
+}) {
+  // Show today's week + last N weeks always (even when empty) so Nick
+  // can scrub back through recent history and backfill any week — not
+  // just the ones with existing sessions. Older weeks that DO have
+  // sessions still appear past the N-week window so historical data
+  // is never hidden.
+  const RECENT_WEEKS_WINDOW = 10;
+  const weeks = useMemo(() => {
+    const set = new Set<string>([todaysWeek, ...Object.keys(sessions)]);
+    // Walk backward from today's week, adding each Sunday key. ISO
+    // date string comparisons sort correctly, so we just append.
+    const todayDate = fromISODate(todaysWeek);
+    for (let i = 1; i <= RECENT_WEEKS_WINDOW; i++) {
+      const d = new Date(todayDate);
+      d.setDate(d.getDate() - 7 * i);
+      set.add(toISODate(d));
+    }
+    return [...set].sort().reverse();
+  }, [sessions, todaysWeek]);
+
+  // Compute a quick "has data" hint per week so the picker shows which ones
+  // actually have stuff in them.
+  function hasData(weekStart: string): boolean {
+    const s = sessions[weekStart];
+    if (!s) return false;
+    return (
+      (s.items?.length ?? 0) > 0 ||
+      (s.riseEntries?.length ?? 0) > 0 ||
+      (s.manualEntries?.length ?? 0) > 0
+    );
+  }
+
+  return (
+    <section className="mt-4">
+      <div className="flex items-center gap-2 text-[10px] uppercase tracking-wider opacity-60 mb-2">
+        <span>Oracles</span>
+        <span className="opacity-50">— click a week to view it</span>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {weeks.map((w) => {
+          const isViewed = w === viewedWeek;
+          const isToday = w === todaysWeek;
+          const populated = hasData(w);
+          return (
+            <button
+              key={w}
+              type="button"
+              onClick={() => onPick(w)}
+              style={
+                isViewed
+                  ? { backgroundColor: "var(--gold)", color: "#000" }
+                  : populated
+                    ? { borderColor: "var(--gold)", color: "var(--gold)" }
+                    : {
+                        borderColor: "var(--gold-dim)",
+                        color: "var(--gold-dim)",
+                      }
+              }
+              className={`text-[11px] px-2.5 py-1 rounded-md transition-all tabular-nums ${
+                isViewed
+                  ? "font-semibold shadow-[0_0_12px_rgba(212,175,55,0.35)]"
+                  : "border hover:brightness-110"
+              }`}
+              title={
+                isToday
+                  ? "This week's Oracle"
+                  : populated
+                    ? `Past Oracle — has data`
+                    : `Past Oracle — empty`
+              }
+            >
+              {formatWeekRange(w)}
+              {isToday && (
+                <span
+                  className={`ml-1.5 text-[9px] uppercase tracking-wider ${
+                    isViewed ? "opacity-70" : "opacity-60"
+                  }`}
+                >
+                  this week
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+/* ─── Weekly Readiness Strip ─────────────────────────────────── */
+
+/** The "is this week ready?" checklist that lives at the top of the
+ * page. Reads pure readiness state, surfaces per-input status, and
+ * lets Nick check off each row when he's intentionally done with it.
+ * Sticky so it stays in view as you scroll. */
+function WeeklyReadinessStrip({
+  readiness,
+  onToggleLock,
+  syncStatus,
+}: {
+  readiness: ReadinessState;
+  onToggleLock: (id: ReadinessRowId) => void;
+  syncStatus: "idle" | "saving" | "saved" | "error";
+}) {
+  const { rows, doneCount, totalCount } = readiness;
+  const allDone = doneCount === totalCount;
+  return (
+    <div className="sticky top-0 z-20 -mx-6 px-6 py-3 mb-4 border-b border-[var(--hairline-strong)] bg-[var(--bg)]/95 backdrop-blur">
+      <div className="flex items-center justify-between gap-4 mb-2">
+        <div className="text-[10px] uppercase tracking-[0.18em] opacity-60">
+          Weekly Readiness
+        </div>
+        <div className="flex items-center gap-3 text-[10px] uppercase tracking-wider">
+          <span
+            className={
+              allDone
+                ? "text-emerald-400/90"
+                : "opacity-60"
+            }
+          >
+            {doneCount}/{totalCount} ready
+          </span>
+          <SyncDot status={syncStatus} />
+        </div>
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2">
+        {rows.map((r) => (
+          <ReadinessRowCard
+            key={r.id}
+            row={r}
+            onToggleLock={() => onToggleLock(r.id)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ReadinessRowCard({
+  row,
+  onToggleLock,
+}: {
+  row: ReadinessRow;
+  onToggleLock: () => void;
+}) {
+  // A row is "done" when the system has detected enough data to call
+  // it ready, OR when Nick has explicitly locked it (e.g. intentionally
+  // skipping debrief this week). The checkbox auto-fills for ready rows
+  // so he doesn't have to manually confirm what the system already sees.
+  const isReady = row.status === "ready";
+  const isPartial = row.status === "partial";
+  const done = isReady || row.locked;
+  const dot = done
+    ? "bg-emerald-400"
+    : isPartial
+      ? "bg-amber-400"
+      : "bg-white/20";
+  // Click semantics:
+  //   - ready & not locked   → click = "actually I'm not done" (sets locked → ... unlocks)
+  //     (We treat lock as user override of system detection. Currently we just
+  //      toggle; future: a separate "explicitly not done" override.)
+  //   - empty / partial      → click = "I'm intentionally skipping this"
+  //   - locked               → click = unlock
+  return (
+    <div
+      className={`rounded-lg border px-3 py-2 flex items-center justify-between gap-2 ${
+        done
+          ? "border-emerald-500/40 bg-emerald-500/[0.04]"
+          : "border-[var(--hairline)] bg-[var(--surface)]"
+      }`}
+    >
+      <div className="min-w-0">
+        <div className="flex items-center gap-1.5 text-xs">
+          <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${dot}`} />
+          <span className="opacity-90 truncate">{row.label}</span>
+        </div>
+        <div className="text-[10px] opacity-55 mt-0.5 truncate">
+          {row.detail}
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={onToggleLock}
+        aria-label={
+          done
+            ? row.locked
+              ? "Unlock input"
+              : "Auto-detected as ready"
+            : "Mark as done"
+        }
+        title={
+          isReady && !row.locked
+            ? "Auto-checked — system detected data is loaded"
+            : row.locked
+              ? "Manually marked done — click to unlock"
+              : "Click to mark intentionally done / skipped"
+        }
+        className={`shrink-0 h-6 w-6 rounded-md border flex items-center justify-center text-[11px] transition ${
+          done
+            ? "border-emerald-400/60 bg-emerald-400/10 text-emerald-300 hover:bg-emerald-400/20"
+            : "border-[var(--hairline-strong)] text-white/50 hover:text-white/90 hover:bg-white/5"
+        }`}
+      >
+        {done ? "✓" : ""}
+      </button>
+    </div>
+  );
+}
+
+function SyncDot({
+  status,
+}: {
+  status: "idle" | "saving" | "saved" | "error";
+}) {
+  const map = {
+    idle: { dot: "bg-white/30", label: "synced" },
+    saving: { dot: "bg-amber-400 animate-pulse", label: "saving…" },
+    saved: { dot: "bg-emerald-400", label: "saved" },
+    error: { dot: "bg-rose-500", label: "save failed" },
+  } as const;
+  const { dot, label } = map[status];
+  return (
+    <span className="flex items-center gap-1.5">
+      <span className={`h-1.5 w-1.5 rounded-full ${dot}`} />
+      <span className="opacity-60">{label}</span>
+    </span>
+  );
+}
+
 /* ─── Header ─────────────────────────────────────────────────── */
 
 function Header({ weekStart }: { weekStart: string }) {
@@ -1703,6 +2109,7 @@ function TimeTrackerSection({
   onUpdateManualEntry,
   onClearSub,
   onRecategorizeSub,
+  onRecategorizeEntry,
 }: {
   range: DateRangeId;
   onRangeChange: (r: DateRangeId) => void;
@@ -1718,6 +2125,11 @@ function TimeTrackerSection({
   onClearSub: (sub: string) => void;
   onRecategorizeSub: (
     fromSub: string,
+    toGroup: "Work" | "Personal",
+    toSub: string,
+  ) => void;
+  onRecategorizeEntry: (
+    entryId: string,
     toGroup: "Work" | "Personal",
     toSub: string,
   ) => void;
@@ -1766,13 +2178,14 @@ function TimeTrackerSection({
     };
     uncategorized = agg.uncategorized;
   } else {
-    const mult = cfg.multiplier;
-    totalMinutes = Math.round(sampleTimeWeek.totalMinutes * mult);
-    deltaMinutes = Math.round(sampleTimeWeek.deltaVsLastWeekMinutes * mult);
-    const w = sampleTimeWeek.groups.find((g) => g.name === "Work")!;
-    const p = sampleTimeWeek.groups.find((g) => g.name === "Personal")!;
-    work = { ...w, subs: w.subs.map((s) => ({ ...s, minutes: Math.round(s.minutes * mult) })) };
-    personal = { ...p, subs: p.subs.map((s) => ({ ...s, minutes: Math.round(s.minutes * mult) })) };
+    // No real data this week — show a true empty state, not the
+    // misleading sample dataset that used to live here. The
+    // SampleBanner above now prompts an upload instead of pretending
+    // the meditation/sauna/cold-plunge sub-buckets are real.
+    totalMinutes = 0;
+    deltaMinutes = 0;
+    work = { name: "Work", color: "gold", subs: [] };
+    personal = { name: "Personal", color: "champagne", subs: [] };
   }
 
   const workMin = work.subs.reduce((s, x) => s + x.minutes, 0);
@@ -1791,8 +2204,8 @@ function TimeTrackerSection({
 
       {!hasReal ? (
         <SampleBanner>
-          Time Tracker is using sample data — upload your Rize CSV below to see
-          your real numbers.
+          No time data this week yet — upload your Rize CSV below (or add a
+          manual entry) to populate the breakdown.
         </SampleBanner>
       ) : (
         <LoadedBanner session={session} />
@@ -1862,6 +2275,7 @@ function TimeTrackerSection({
           onHideEntry={onHideEntry}
           onClearSub={onClearSub}
           onRecategorizeSub={onRecategorizeSub}
+          onRecategorizeEntry={onRecategorizeEntry}
           onAddSubInGroup={openAdderForGroup}
         />
         <CategoryGroupCard
@@ -1872,6 +2286,7 @@ function TimeTrackerSection({
           onHideEntry={onHideEntry}
           onClearSub={onClearSub}
           onRecategorizeSub={onRecategorizeSub}
+          onRecategorizeEntry={onRecategorizeEntry}
           onAddSubInGroup={openAdderForGroup}
         />
       </div>
@@ -3139,6 +3554,7 @@ function CategoryGroupCard({
   onHideEntry,
   onClearSub,
   onRecategorizeSub,
+  onRecategorizeEntry,
   onAddSubInGroup,
 }: {
   group: CategoryGroup;
@@ -3149,6 +3565,11 @@ function CategoryGroupCard({
   onClearSub?: (sub: string) => void;
   onRecategorizeSub?: (
     fromSub: string,
+    toGroup: "Work" | "Personal",
+    toSub: string,
+  ) => void;
+  onRecategorizeEntry?: (
+    entryId: string,
     toGroup: "Work" | "Personal",
     toSub: string,
   ) => void;
@@ -3183,7 +3604,13 @@ function CategoryGroupCard({
 
       <ul className="space-y-2.5">
         {group.subs.map((s) => {
+          // `pct` is the bar width relative to the largest sub in this
+          // bucket — used for visual scale. `shareOfBucket` is the
+          // actual % of total minutes this sub represents, shown to
+          // the user so they can see "where is my time going."
           const pct = Math.round((s.minutes / max) * 100);
+          const shareOfBucket =
+            total > 0 ? Math.round((s.minutes / total) * 100) : 0;
           const isOpen = openSub === s.name;
           const subColor = colorForSub(s.name, group.name);
           const subEntries = entries
@@ -3220,6 +3647,9 @@ function CategoryGroupCard({
                     className="tabular-nums"
                   >
                     {fmtMinutes(s.minutes)}
+                    <span className="opacity-55 ml-1.5 text-[10px]">
+                      {shareOfBucket}%
+                    </span>
                   </span>
                 </div>
                 <div className="h-1.5 mt-1 rounded bg-black/60 overflow-hidden">
@@ -3245,40 +3675,13 @@ function CategoryGroupCard({
                   style={{ borderColor: subColor + "55" }}
                 >
                   {subEntries.map((e, i) => (
-                    <li
+                    <EntryRow
                       key={e.id ?? i}
-                      className="text-[11px] flex gap-2 leading-snug items-center group/sub hover:bg-black/20 -mx-1 px-1 py-0.5 rounded"
-                    >
-                      <span className="tabular-nums opacity-50 shrink-0 w-12">
-                        {fmtTime(e.startISO)}
-                      </span>
-                      <span
-                        style={{ color: subColor }}
-                        className="tabular-nums shrink-0 w-10 text-right"
-                      >
-                        {e.minutes}m
-                      </span>
-                      <span
-                        className="opacity-80 flex-1 truncate"
-                        title={e.description}
-                      >
-                        {truncate(e.description, 60)}
-                      </span>
-                      {e.id && onHideEntry && (
-                        <button
-                          type="button"
-                          onClick={(ev) => {
-                            ev.stopPropagation();
-                            onHideEntry(e.id!);
-                          }}
-                          className="opacity-0 group-hover/sub:opacity-50 hover:!opacity-100 hover:text-rose-400 transition text-[10px] shrink-0"
-                          aria-label="Hide entry"
-                          title="Hide this entry"
-                        >
-                          ✕
-                        </button>
-                      )}
-                    </li>
+                      entry={e}
+                      subColor={subColor}
+                      onHideEntry={onHideEntry}
+                      onRecategorizeEntry={onRecategorizeEntry}
+                    />
                   ))}
                 </ul>
               )}
@@ -3296,6 +3699,233 @@ function CategoryGroupCard({
           ＋ add entry / sub-category
         </button>
       )}
+    </div>
+  );
+}
+
+/* ─── Single time-tracker entry row + per-entry move popover ───── */
+
+/** Hardcoded list of available sub-buckets per group. Kept in sync
+ * with the ManualEntryAdder list at the top of the file. If we ever
+ * make these user-configurable, factor this out into a constant in
+ * lib/spiros.ts. */
+const SUB_OPTIONS = {
+  Work: [
+    "Projects",
+    "Strategy",
+    "Social media content",
+    "Meetings",
+    "Connections",
+    "Other",
+  ],
+  Personal: [
+    "Meditation",
+    "Workouts",
+    "Sauna",
+    "Cold plunge",
+    "Dates",
+    "Distracted",
+    "Recovery",
+    "Family",
+    "Other",
+  ],
+} as const;
+
+function EntryRow({
+  entry,
+  subColor,
+  onHideEntry,
+  onRecategorizeEntry,
+}: {
+  entry: RizeEntry;
+  subColor: string;
+  onHideEntry?: (id: string) => void;
+  onRecategorizeEntry?: (
+    entryId: string,
+    toGroup: "Work" | "Personal",
+    toSub: string,
+  ) => void;
+}) {
+  const [moveOpen, setMoveOpen] = useState(false);
+  return (
+    <li className="relative text-[11px] flex gap-2 leading-snug items-center group/sub hover:bg-black/20 -mx-1 px-1 py-0.5 rounded">
+      <span className="tabular-nums opacity-50 shrink-0 w-12">
+        {fmtTime(entry.startISO)}
+      </span>
+      <span
+        style={{ color: subColor }}
+        className="tabular-nums shrink-0 w-10 text-right"
+      >
+        {entry.minutes}m
+      </span>
+      <span
+        className="opacity-80 flex-1 truncate"
+        title={entry.description}
+      >
+        {truncate(entry.description, 60)}
+      </span>
+      {entry.id && onRecategorizeEntry && (
+        <button
+          type="button"
+          onClick={(ev) => {
+            ev.stopPropagation();
+            setMoveOpen((v) => !v);
+          }}
+          className={`transition text-[10px] shrink-0 ${
+            moveOpen
+              ? "opacity-100 text-white"
+              : "opacity-0 group-hover/sub:opacity-50 hover:!opacity-100"
+          }`}
+          aria-label="Move entry to another bucket"
+          title="Move this entry to another bucket"
+        >
+          ↗
+        </button>
+      )}
+      {entry.id && onHideEntry && (
+        <button
+          type="button"
+          onClick={(ev) => {
+            ev.stopPropagation();
+            onHideEntry(entry.id!);
+          }}
+          className="opacity-0 group-hover/sub:opacity-50 hover:!opacity-100 hover:text-rose-400 transition text-[10px] shrink-0"
+          aria-label="Hide entry"
+          title="Hide this entry"
+        >
+          ✕
+        </button>
+      )}
+      {moveOpen && entry.id && onRecategorizeEntry && (
+        <EntryMover
+          currentGroup={entry.group === "Uncategorized" ? "Work" : entry.group}
+          currentSub={entry.sub}
+          onPick={(toGroup, toSub) => {
+            setMoveOpen(false);
+            onRecategorizeEntry(entry.id!, toGroup, toSub);
+          }}
+          onClose={() => setMoveOpen(false)}
+        />
+      )}
+    </li>
+  );
+}
+
+/** Compact popover anchored to the EntryRow. Shows Work + Personal
+ * sub options as a two-column grid; clicking one commits the move. */
+function EntryMover({
+  currentGroup,
+  currentSub,
+  onPick,
+  onClose,
+}: {
+  currentGroup: "Work" | "Personal";
+  currentSub: string;
+  onPick: (toGroup: "Work" | "Personal", toSub: string) => void;
+  onClose: () => void;
+}) {
+  // Close on Escape so the popover is keyboard-dismissible.
+  useEffect(() => {
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="absolute right-0 top-full mt-1 z-30 w-[280px] rounded-lg border border-[var(--hairline-strong)] bg-black/95 backdrop-blur shadow-xl p-3"
+      onClick={(ev) => ev.stopPropagation()}
+    >
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[10px] uppercase tracking-wider opacity-60">
+          Move to
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="text-[10px] opacity-50 hover:opacity-100"
+          aria-label="Close"
+        >
+          ✕
+        </button>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <MoverColumn
+          label="Work"
+          color="var(--gold)"
+          subs={SUB_OPTIONS.Work as unknown as string[]}
+          currentGroup={currentGroup}
+          currentSub={currentSub}
+          onPick={(sub) => onPick("Work", sub)}
+        />
+        <MoverColumn
+          label="Personal"
+          color="var(--champagne)"
+          subs={SUB_OPTIONS.Personal as unknown as string[]}
+          currentGroup={currentGroup}
+          currentSub={currentSub}
+          onPick={(sub) => onPick("Personal", sub)}
+        />
+      </div>
+    </div>
+  );
+}
+
+function MoverColumn({
+  label,
+  color,
+  subs,
+  currentGroup,
+  currentSub,
+  onPick,
+}: {
+  label: "Work" | "Personal";
+  color: string;
+  subs: string[];
+  currentGroup: "Work" | "Personal";
+  currentSub: string;
+  onPick: (sub: string) => void;
+}) {
+  return (
+    <div>
+      <div
+        style={{ color }}
+        className="text-[10px] uppercase tracking-wider mb-1 font-semibold"
+      >
+        {label}
+      </div>
+      <ul className="space-y-0.5">
+        {subs.map((s) => {
+          const isCurrent =
+            currentGroup === label && currentSub.toLowerCase() === s.toLowerCase();
+          return (
+            <li key={s}>
+              <button
+                type="button"
+                disabled={isCurrent}
+                onClick={() => onPick(s)}
+                className={`w-full text-left text-[11px] px-1.5 py-1 rounded transition ${
+                  isCurrent
+                    ? "opacity-40 cursor-default bg-white/[0.04]"
+                    : "opacity-80 hover:opacity-100 hover:bg-white/10"
+                }`}
+                title={
+                  isCurrent
+                    ? "Already in this bucket"
+                    : `Move to ${label} / ${s}`
+                }
+              >
+                {s}
+                {isCurrent && (
+                  <span className="ml-1 text-[9px] opacity-50">· current</span>
+                )}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
@@ -3992,6 +4622,19 @@ function PriorityDetail({
       className="mt-5 pt-5 border-t border-[var(--hairline)] grid grid-cols-1 md:grid-cols-[1fr_280px] gap-6"
     >
       <div className="space-y-5">
+        <div>
+          <div className="text-[10px] uppercase tracking-[0.18em] opacity-60 mb-1">
+            Title
+          </div>
+          <input
+            type="text"
+            value={item.title}
+            onChange={(e) => onUpdateItem(item.id, { title: e.target.value })}
+            placeholder="Priority title"
+            className="w-full rounded-md border border-[var(--hairline)] bg-black/40 px-3 py-2 text-sm font-medium focus:outline-none focus:border-[var(--gold)]"
+          />
+        </div>
+
         <div>
           <div className="text-[10px] uppercase tracking-[0.18em] opacity-60 mb-1">
             Notes

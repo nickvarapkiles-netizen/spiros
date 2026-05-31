@@ -33,9 +33,148 @@ export type OracleSession = {
   calendarFetchedAt?: number;
   chat?: ChatMessage[];
   debrief?: Debrief;
+  /** User-asserted "I'm done with this input" checkmarks. Editing the
+   * underlying data does NOT unlock automatically — the lock is just a
+   * GTD-style signal so Nick and the Oracle know what's intentional. */
+  lockedInputs?: {
+    calendar?: boolean;
+    rize?: boolean;
+    brainDump?: boolean;
+    priorities?: boolean;
+    debrief?: boolean;
+  };
 };
 
+export type ReadinessRowId =
+  | "calendar"
+  | "rize"
+  | "brainDump"
+  | "priorities"
+  | "debrief";
+
+export type ReadinessRow = {
+  id: ReadinessRowId;
+  label: string;
+  status: "empty" | "partial" | "ready";
+  detail: string;
+  locked: boolean;
+};
+
+export type ReadinessState = {
+  rows: ReadinessRow[];
+  doneCount: number;
+  totalCount: number;
+};
+
+/** Pure derivation: given a session, compute the readiness of each
+ * input. UI renders this; Oracle reads it to ask clarifying questions
+ * before plowing ahead with stale or missing data. */
+export function computeReadiness(session: OracleSession): ReadinessState {
+  const locks = session.lockedInputs ?? {};
+
+  // Calendar: ready if we have any synced data, partial if iCal URL is
+  // configured but no events yet, empty otherwise.
+  const calEventCount = session.calendarEvents?.length ?? 0;
+  const hasCalImage = !!session.calendarImage;
+  const hasIcal = !!session.calendarEvents || hasCalImage;
+  const calendar: ReadinessRow = {
+    id: "calendar",
+    label: "Calendar",
+    status: hasIcal ? "ready" : "empty",
+    detail: hasIcal
+      ? calEventCount > 0
+        ? `${calEventCount} event${calEventCount === 1 ? "" : "s"}`
+        : "screenshot uploaded"
+      : "not synced",
+    locked: !!locks.calendar,
+  };
+
+  // Rize: ready if any entries (Rize CSV OR manual entries) exist.
+  const rizeCount = session.riseEntries?.length ?? 0;
+  const manualCount = session.manualEntries?.length ?? 0;
+  const totalEntries = rizeCount + manualCount;
+  const rize: ReadinessRow = {
+    id: "rize",
+    label: "Rize CSV",
+    status: totalEntries > 0 ? "ready" : "empty",
+    detail:
+      totalEntries > 0
+        ? `${totalEntries} ${totalEntries === 1 ? "entry" : "entries"}`
+        : "no time data",
+    locked: !!locks.rize,
+  };
+
+  // Brain dump: empty if no transcript, partial if very short (<60 chars
+  // — likely just a stray paste or placeholder), ready otherwise.
+  const transcript = (session.transcript ?? "").trim();
+  const transcriptLen = transcript.length;
+  const brainDump: ReadinessRow = {
+    id: "brainDump",
+    label: "Brain dump",
+    status:
+      transcriptLen === 0
+        ? "empty"
+        : transcriptLen < 60
+          ? "partial"
+          : "ready",
+    detail:
+      transcriptLen === 0
+        ? "no transcript yet"
+        : `${transcriptLen.toLocaleString()} chars`,
+    locked: !!locks.brainDump,
+  };
+
+  // Priorities: ready if items exist. Partial concept doesn't really
+  // apply (you either have priorities or you don't).
+  const itemCount = session.items?.length ?? 0;
+  const priorities: ReadinessRow = {
+    id: "priorities",
+    label: "Priorities",
+    status: itemCount > 0 ? "ready" : "empty",
+    detail:
+      itemCount > 0
+        ? `${itemCount} item${itemCount === 1 ? "" : "s"}`
+        : "no RICE items",
+    locked: !!locks.priorities,
+  };
+
+  // Debrief: ready when a summary exists. "in_progress" counts as partial.
+  const dStatus = session.debrief?.status;
+  const debrief: ReadinessRow = {
+    id: "debrief",
+    label: "Debrief",
+    status:
+      dStatus === "ready"
+        ? "ready"
+        : dStatus === "in_progress" || dStatus === "finalizing"
+          ? "partial"
+          : "empty",
+    detail:
+      dStatus === "ready"
+        ? "complete"
+        : dStatus === "in_progress"
+          ? "in progress"
+          : dStatus === "finalizing"
+            ? "finalizing"
+            : "not started",
+    locked: !!locks.debrief,
+  };
+
+  const rows = [calendar, rize, brainDump, priorities, debrief];
+  // A row counts as "done" when it's either user-locked OR has reached
+  // ready status on its own. Locked-but-empty rows count too — that's
+  // the "I'm intentionally skipping this" signal.
+  const doneCount = rows.filter(
+    (r) => r.locked || r.status === "ready",
+  ).length;
+
+  return { rows, doneCount, totalCount: rows.length };
+}
+
 export type CategoryOverride = {
+  /** Single specific entry by id — highest precedence. Used when Nick
+   * clicks "move" on one entry in the time tracker. */
+  entryId?: string;
   /** Substring (case-insensitive) match against entry description. */
   pattern?: string;
   /** Match entries whose CURRENT sub equals this (case-insensitive). */
@@ -312,16 +451,80 @@ export function emptyState(): SpirosState {
   return { version: 1, sessions: {} };
 }
 
+// ─── Server-backed persistence ──────────────────────────────────
+// localStorage is a fast in-browser cache. The /api/state endpoint
+// (Neon Postgres) is the source of truth so data survives across
+// deploys, browsers, devices, and incognito sessions.
+
+export type ServerStateResponse = {
+  state: SpirosState | null;
+  updatedAt: string | null;
+};
+
+/** Fetch the canonical state from the server. Returns null if the
+ * server has no row yet for this user (fresh install). */
+export async function loadStateFromServer(): Promise<SpirosState | null> {
+  const res = await fetch("/api/state", { cache: "no-store" });
+  if (!res.ok) {
+    throw new Error(`load failed: ${res.status}`);
+  }
+  const body = (await res.json()) as ServerStateResponse;
+  if (!body.state) return null;
+  return migrateEntryIds(migrateOracleKeys(body.state));
+}
+
+/** Push the full state blob to the server. Whole-document upsert. */
+export async function saveStateToServer(state: SpirosState): Promise<void> {
+  const res = await fetch("/api/state", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ state }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`save failed: ${res.status} ${text}`);
+  }
+}
+
 export function ensureSession(
   state: SpirosState,
   weekStart: string,
+  /** When true, copy unfinished priorities forward from the most
+   * recent prior week that has any open items. Used on initial load
+   * for the current week so Nick's open priorities don't disappear
+   * just because Sunday rolled over. NOT used when navigating to
+   * arbitrary past weeks — we don't want history to mutate. */
+  carryForwardOpenItems: boolean = false,
 ): SpirosState {
   if (state.sessions[weekStart]) return state;
+  let initialItems: RiceItem[] = [];
+  if (carryForwardOpenItems) {
+    const priorWeeks = Object.keys(state.sessions)
+      .filter((k) => k < weekStart)
+      .sort()
+      .reverse();
+    for (const k of priorWeeks) {
+      const s = state.sessions[k];
+      const open = (s.items ?? []).filter(
+        (it) => !it.done && (it.progress ?? 0) < 100,
+      );
+      if (open.length > 0) {
+        // Fresh ids so the carried-forward priorities are independent
+        // from the originals (editing one doesn't mutate history).
+        initialItems = open.map((it) => ({
+          ...it,
+          id: crypto.randomUUID(),
+          createdAt: Date.now(),
+        }));
+        break;
+      }
+    }
+  }
   return {
     ...state,
     sessions: {
       ...state.sessions,
-      [weekStart]: { weekStart, items: [], transcript: "" },
+      [weekStart]: { weekStart, items: initialItems, transcript: "" },
     },
   };
 }
@@ -501,8 +704,22 @@ export function getEffectiveEntries(
     ...(manualEntries ?? []).map(ensureId),
   ].filter((e) => !hidden.has(e.id!));
   if (!overrides || overrides.length === 0) return all;
+  // Precedence: entryId override wins over pattern/sub overrides. Among
+  // overrides of the same type, the LAST one applied wins (so re-moving
+  // an entry just overwrites the previous override visually). We scan
+  // entry-id overrides first; if any matches we use it and skip the rest.
   return all.map((e) => {
+    let entryIdMatch: CategoryOverride | undefined;
     for (const o of overrides) {
+      if (o.entryId && e.id && o.entryId === e.id) {
+        entryIdMatch = o; // last write wins
+      }
+    }
+    if (entryIdMatch) {
+      return { ...e, group: entryIdMatch.group, sub: entryIdMatch.sub };
+    }
+    for (const o of overrides) {
+      if (o.entryId) continue; // already handled above
       const p = o.pattern?.toLowerCase();
       const fromSub = o.fromSub?.toLowerCase();
       const matchesPattern =
