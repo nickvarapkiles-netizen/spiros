@@ -19,6 +19,7 @@ import {
   aggregateEntries,
   colorForSub,
   computeReadiness,
+  displaySub,
   emptyState,
   ensureSession,
   loadStateFromServer,
@@ -368,6 +369,28 @@ export default function Home() {
     flashToast(`✓ Moved entry → ${toGroup}/${toSub}`);
   }
 
+  /** Set or clear a display alias for a sub-bucket. Pass empty string
+   * (or the canonical name back) as `newName` to clear the alias. The
+   * change is global (lives on SpirosState, not on a single session)
+   * so renaming "Dates" to "Relationships" applies across every week. */
+  function setSubAlias(canonical: string, newName: string) {
+    setState((prev) => {
+      const aliases = { ...(prev.subAliases ?? {}) };
+      const cleaned = newName.trim();
+      if (!cleaned || cleaned.toLowerCase() === canonical.toLowerCase()) {
+        delete aliases[canonical];
+      } else {
+        aliases[canonical] = cleaned;
+      }
+      return { ...prev, subAliases: aliases };
+    });
+    flashToast(
+      newName.trim() && newName.trim().toLowerCase() !== canonical.toLowerCase()
+        ? `✓ Renamed "${canonical}" → "${newName.trim()}"`
+        : `✓ Cleared rename for "${canonical}"`,
+    );
+  }
+
   /** Add a sub→sub override so all entries currently tagged with `fromSub`
    * display under the new group/sub. */
   function recategorizeSub(
@@ -481,6 +504,8 @@ export default function Home() {
         onClearSub={clearSub}
         onRecategorizeSub={recategorizeSub}
         onRecategorizeEntry={recategorizeEntry}
+        subAliases={state.subAliases}
+        onRenameSub={setSubAlias}
       />
       <StrategySection
         transcript={session.transcript}
@@ -2110,6 +2135,8 @@ function TimeTrackerSection({
   onClearSub,
   onRecategorizeSub,
   onRecategorizeEntry,
+  subAliases,
+  onRenameSub,
 }: {
   range: DateRangeId;
   onRangeChange: (r: DateRangeId) => void;
@@ -2133,6 +2160,8 @@ function TimeTrackerSection({
     toGroup: "Work" | "Personal",
     toSub: string,
   ) => void;
+  subAliases?: Record<string, string>;
+  onRenameSub: (canonical: string, newName: string) => void;
 }) {
   const cfg = DATE_RANGES.find((r) => r.id === range)!;
   const hasReal = !!(session.riseEntries && session.riseEntries.length > 0) || !!(session.manualEntries && session.manualEntries.length > 0);
@@ -2278,6 +2307,8 @@ function TimeTrackerSection({
           onRecategorizeSub={onRecategorizeSub}
           onRecategorizeEntry={onRecategorizeEntry}
           onAddSubInGroup={openAdderForGroup}
+          subAliases={subAliases}
+          onRenameSub={onRenameSub}
         />
         <CategoryGroupCard
           group={personal}
@@ -2290,6 +2321,8 @@ function TimeTrackerSection({
           onRecategorizeSub={onRecategorizeSub}
           onRecategorizeEntry={onRecategorizeEntry}
           onAddSubInGroup={openAdderForGroup}
+          subAliases={subAliases}
+          onRenameSub={onRenameSub}
         />
       </div>
 
@@ -2667,6 +2700,8 @@ function SubActions({
   color,
   onClearSub,
   onRecategorizeSub,
+  subAliases,
+  onRenameSub,
 }: {
   sub: string;
   groupName: "Work" | "Personal";
@@ -2679,18 +2714,42 @@ function SubActions({
     toGroup: "Work" | "Personal",
     toSub: string,
   ) => void;
+  subAliases?: Record<string, string>;
+  onRenameSub?: (canonical: string, newName: string) => void;
 }) {
   const [showMove, setShowMove] = useState(false);
   const [toGroup, setToGroup] = useState<"Work" | "Personal">(groupName);
   const [toSub, setToSub] = useState("");
+  const [showRename, setShowRename] = useState(false);
+  const currentAlias = subAliases?.[sub] ?? "";
+  const [renameDraft, setRenameDraft] = useState(currentAlias);
+  const hasAlias = !!currentAlias && currentAlias !== sub;
 
-  if (count === 0 && !showMove) return null;
+  if (count === 0 && !showMove && !showRename) return null;
 
   return (
     <div className="mt-2 mb-1 flex items-center justify-end gap-3 text-[10px] uppercase tracking-wider">
       <span className="opacity-50">
         {count} entr{count === 1 ? "y" : "ies"} · {fmtMinutes(totalMin)}
       </span>
+      {onRenameSub && (
+        <button
+          type="button"
+          onClick={() => {
+            setRenameDraft(currentAlias || sub);
+            setShowRename((v) => !v);
+          }}
+          style={{ color }}
+          className="opacity-70 hover:opacity-100"
+          title={
+            hasAlias
+              ? `Currently renamed to "${currentAlias}" — click to edit or clear`
+              : "Rename this sub-bucket (display only — data stays the same)"
+          }
+        >
+          {showRename ? "cancel" : "✎ rename"}
+        </button>
+      )}
       {onRecategorizeSub && (
         <button
           type="button"
@@ -2761,6 +2820,46 @@ function SubActions({
           >
             move
           </button>
+        </form>
+      )}
+      {showRename && onRenameSub && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            onRenameSub(sub, renameDraft);
+            setShowRename(false);
+          }}
+          className="flex items-center gap-1 normal-case tracking-normal"
+        >
+          <span className="opacity-60">{sub} →</span>
+          <input
+            type="text"
+            value={renameDraft}
+            onChange={(e) => setRenameDraft(e.target.value)}
+            placeholder="new display name"
+            autoFocus
+            className="text-[11px] px-1.5 py-0.5 rounded bg-black/40 border border-[var(--hairline)] focus:outline-none focus:border-[var(--gold)] w-32"
+          />
+          <button
+            type="submit"
+            style={{ backgroundColor: color, color: "#000" }}
+            className="text-[10px] px-2 py-0.5 rounded font-semibold"
+          >
+            save
+          </button>
+          {hasAlias && (
+            <button
+              type="button"
+              onClick={() => {
+                onRenameSub(sub, ""); // empty = clear alias
+                setShowRename(false);
+              }}
+              className="text-[10px] opacity-60 hover:opacity-100 hover:text-rose-400"
+              title="Clear rename — go back to the original name"
+            >
+              ✕ clear
+            </button>
+          )}
         </form>
       )}
     </div>
@@ -3559,6 +3658,8 @@ function CategoryGroupCard({
   onRecategorizeSub,
   onRecategorizeEntry,
   onAddSubInGroup,
+  subAliases,
+  onRenameSub,
 }: {
   group: CategoryGroup;
   accent: string;
@@ -3582,6 +3683,8 @@ function CategoryGroupCard({
     toSub: string,
   ) => void;
   onAddSubInGroup?: (group: "Work" | "Personal") => void;
+  subAliases?: Record<string, string>;
+  onRenameSub?: (canonical: string, newName: string) => void;
 }) {
   const total = group.subs.reduce((s, x) => s + x.minutes, 0);
   const max = Math.max(1, ...group.subs.map((s) => s.minutes));
@@ -3650,7 +3753,7 @@ function CategoryGroupCard({
                       className="h-2 w-2 rounded-full shrink-0"
                       style={{ backgroundColor: subColor }}
                     />
-                    {s.name}
+                    {displaySub(s.name, subAliases)}
                     {hasEntries && (
                       <span className="text-[9px] opacity-50">
                         {isOpen ? "▾" : "▸"}
@@ -3683,6 +3786,8 @@ function CategoryGroupCard({
                   color={subColor}
                   onClearSub={onClearSub}
                   onRecategorizeSub={onRecategorizeSub}
+                  subAliases={subAliases}
+                  onRenameSub={onRenameSub}
                 />
               )}
               {isOpen && subEntries.length > 0 && (
@@ -3696,6 +3801,7 @@ function CategoryGroupCard({
                       subColor={subColor}
                       onHideEntry={onHideEntry}
                       onRecategorizeEntry={onRecategorizeEntry}
+                      subAliases={subAliases}
                     />
                   ))}
                 </ul>
@@ -3751,6 +3857,7 @@ function EntryRow({
   subColor,
   onHideEntry,
   onRecategorizeEntry,
+  subAliases,
 }: {
   entry: RizeEntry;
   subColor: string;
@@ -3760,6 +3867,7 @@ function EntryRow({
     toGroup: "Work" | "Personal",
     toSub: string,
   ) => void;
+  subAliases?: Record<string, string>;
 }) {
   const [moveOpen, setMoveOpen] = useState(false);
   return (
@@ -3820,6 +3928,7 @@ function EntryRow({
             onRecategorizeEntry(entry.id!, toGroup, toSub);
           }}
           onClose={() => setMoveOpen(false)}
+          subAliases={subAliases}
         />
       )}
     </li>
@@ -3833,11 +3942,13 @@ function EntryMover({
   currentSub,
   onPick,
   onClose,
+  subAliases,
 }: {
   currentGroup: "Work" | "Personal";
   currentSub: string;
   onPick: (toGroup: "Work" | "Personal", toSub: string) => void;
   onClose: () => void;
+  subAliases?: Record<string, string>;
 }) {
   // Close on Escape so the popover is keyboard-dismissible.
   useEffect(() => {
@@ -3874,6 +3985,7 @@ function EntryMover({
           currentGroup={currentGroup}
           currentSub={currentSub}
           onPick={(sub) => onPick("Work", sub)}
+          subAliases={subAliases}
         />
         <MoverColumn
           label="Personal"
@@ -3882,6 +3994,7 @@ function EntryMover({
           currentGroup={currentGroup}
           currentSub={currentSub}
           onPick={(sub) => onPick("Personal", sub)}
+          subAliases={subAliases}
         />
       </div>
     </div>
@@ -3895,6 +4008,7 @@ function MoverColumn({
   currentGroup,
   currentSub,
   onPick,
+  subAliases,
 }: {
   label: "Work" | "Personal";
   color: string;
@@ -3902,6 +4016,7 @@ function MoverColumn({
   currentGroup: "Work" | "Personal";
   currentSub: string;
   onPick: (sub: string) => void;
+  subAliases?: Record<string, string>;
 }) {
   return (
     <div>
@@ -3929,10 +4044,10 @@ function MoverColumn({
                 title={
                   isCurrent
                     ? "Already in this bucket"
-                    : `Move to ${label} / ${s}`
+                    : `Move to ${label} / ${displaySub(s, subAliases)}`
                 }
               >
-                {s}
+                {displaySub(s, subAliases)}
                 {isCurrent && (
                   <span className="ml-1 text-[9px] opacity-50">· current</span>
                 )}

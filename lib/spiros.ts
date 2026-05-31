@@ -270,7 +270,23 @@ export type SpirosState = {
   version: 1;
   sessions: Record<string, OracleSession>; // keyed by weekStart
   calendarIcalUrl?: string;
+  /** Display-only renames for time-tracker sub-buckets. Key = canonical
+   * name used in the regex categorizer and stored on every RizeEntry
+   * (e.g. "Dates"); value = what the user wants displayed instead
+   * (e.g. "Relationships"). The underlying data never changes — only
+   * the rendered label — so future Rize uploads keep working without
+   * a data migration. */
+  subAliases?: Record<string, string>;
 };
+
+/** Resolve the user-facing label for a sub-bucket. Falls back to the
+ * canonical name when no alias is set. */
+export function displaySub(
+  canonical: string,
+  aliases?: Record<string, string>,
+): string {
+  return aliases?.[canonical]?.trim() || canonical;
+}
 
 export type CalEvent = {
   uid: string;
