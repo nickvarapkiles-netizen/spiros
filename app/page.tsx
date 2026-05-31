@@ -2272,6 +2272,7 @@ function TimeTrackerSection({
           accent="var(--gold)"
           accentDim="var(--gold-dim)"
           entries={filteredEntries.filter((e) => e.group === "Work")}
+          grandTotalMinutes={workMin + personalMin}
           onHideEntry={onHideEntry}
           onClearSub={onClearSub}
           onRecategorizeSub={onRecategorizeSub}
@@ -2283,6 +2284,7 @@ function TimeTrackerSection({
           accent="var(--champagne)"
           accentDim="var(--champagne-dim)"
           entries={filteredEntries.filter((e) => e.group === "Personal")}
+          grandTotalMinutes={workMin + personalMin}
           onHideEntry={onHideEntry}
           onClearSub={onClearSub}
           onRecategorizeSub={onRecategorizeSub}
@@ -3551,6 +3553,7 @@ function CategoryGroupCard({
   accent,
   accentDim,
   entries = [],
+  grandTotalMinutes,
   onHideEntry,
   onClearSub,
   onRecategorizeSub,
@@ -3561,6 +3564,11 @@ function CategoryGroupCard({
   accent: string;
   accentDim: string;
   entries?: RizeEntry[];
+  /** Sum of minutes across Work + Personal for the viewed range —
+   * used as the denominator when computing each sub's % so the
+   * numbers add up to ~100% across the whole week, not within just
+   * one bucket. */
+  grandTotalMinutes?: number;
   onHideEntry?: (id: string) => void;
   onClearSub?: (sub: string) => void;
   onRecategorizeSub?: (
@@ -3577,6 +3585,10 @@ function CategoryGroupCard({
 }) {
   const total = group.subs.reduce((s, x) => s + x.minutes, 0);
   const max = Math.max(1, ...group.subs.map((s) => s.minutes));
+  // Fall back to bucket total if parent didn't pass a grand total
+  // (keeps the component standalone-safe for any future caller).
+  const denominator =
+    grandTotalMinutes && grandTotalMinutes > 0 ? grandTotalMinutes : total;
   const [openSub, setOpenSub] = useState<string | null>(null);
   const hasEntries = entries.length > 0;
 
@@ -3605,12 +3617,15 @@ function CategoryGroupCard({
       <ul className="space-y-2.5">
         {group.subs.map((s) => {
           // `pct` is the bar width relative to the largest sub in this
-          // bucket — used for visual scale. `shareOfBucket` is the
-          // actual % of total minutes this sub represents, shown to
-          // the user so they can see "where is my time going."
+          // bucket — used for visual scale only. `shareOfTotal` is the
+          // actual % this sub represents out of ALL tracked time
+          // (Work + Personal combined), so Nick can answer "what % of
+          // my week went to Workouts" without doing mental math.
           const pct = Math.round((s.minutes / max) * 100);
-          const shareOfBucket =
-            total > 0 ? Math.round((s.minutes / total) * 100) : 0;
+          const shareOfTotal =
+            denominator > 0
+              ? Math.round((s.minutes / denominator) * 100)
+              : 0;
           const isOpen = openSub === s.name;
           const subColor = colorForSub(s.name, group.name);
           const subEntries = entries
@@ -3648,7 +3663,7 @@ function CategoryGroupCard({
                   >
                     {fmtMinutes(s.minutes)}
                     <span className="opacity-55 ml-1.5 text-[10px]">
-                      {shareOfBucket}%
+                      {shareOfTotal}%
                     </span>
                   </span>
                 </div>
